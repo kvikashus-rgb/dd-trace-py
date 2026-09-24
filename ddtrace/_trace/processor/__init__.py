@@ -2,13 +2,18 @@ import abc
 from collections import defaultdict
 from itertools import chain
 import logging
+import threading
 from typing import Optional
+from typing import cast
 
+from ddtrace._trace.context import _set_runtime_identity_generation
 from ddtrace._trace.sampler import DatadogSampler
+from ddtrace._trace.span import _RUNTIME_IDENTITY_GENERATION_KEY
 from ddtrace._trace.span import Span
 from ddtrace._trace.span import _get_64_highest_order_bits_as_hex
 from ddtrace.constants import _APM_ENABLED_METRIC_KEY
 from ddtrace.constants import _SINGLE_SPAN_SAMPLING_MECHANISM
+from ddtrace.internal import forksafe
 from ddtrace.internal import gitmetadata
 from ddtrace.internal import process_tags
 from ddtrace.internal.constants import COMPONENT
@@ -22,13 +27,13 @@ from ddtrace.internal.logger import get_logger
 from ddtrace.internal.rate_limiter import RateLimiter
 from ddtrace.internal.sampling import SpanSamplingRule
 from ddtrace.internal.sampling import get_span_sampling_rules
+from ddtrace.internal.serverless import in_aws_lambda_microvm
 from ddtrace.internal.service import ServiceStatusError
 from ddtrace.internal.settings._config import config
 from ddtrace.internal.settings.standalone import standalone_config
 from ddtrace.internal.telemetry.constants import TELEMETRY_NAMESPACE
 from ddtrace.internal.telemetry.metrics import MetricRecorder
 from ddtrace.internal.telemetry.metrics import get_metric_recorder
-from ddtrace.internal.threads import RLock
 from ddtrace.internal.writer import AgentResponse
 from ddtrace.internal.writer import LogWriter
 from ddtrace.internal.writer import create_trace_writer
@@ -354,9 +359,12 @@ class SpanAggregator(SpanProcessor):
             response_callback=self._agent_response_callback,
             agentless=_resolve_apm_trace_agentless(),
         )
-        # Initialize the trace buffer and lock
+        # Only MicroVM identity refreshes need transition serialization.
+        self._runtime_identity_generation: Optional[int] = 0 if in_aws_lambda_microvm() else None
         self._traces: defaultdict[int, _Trace] = defaultdict(lambda: _Trace())
-        self._lock: RLock = RLock()
+        self._lock = forksafe.RLock()
+        # A sync-mode writer whose send was deferred until the finishing thread releases its locks.
+        self._pending_sync_flush = threading.local()
         super().__init__()
 
     def __repr__(self) -> str:
@@ -372,10 +380,70 @@ class SpanAggregator(SpanProcessor):
             f"{self.writer})"
         )
 
+    @property
+    def _identity_refresh_enabled(self) -> bool:
+        """Whether this aggregator was initialized for MicroVM identity refresh."""
+        return self._runtime_identity_generation is not None
+
+    def _capture_identity_generation(self) -> Optional[int]:
+        """Capture the MicroVM identity generation for a span start."""
+        # None disables transition tracking outside MicroVMs and avoids span bookkeeping there.
+        if not self._identity_refresh_enabled:
+            return None
+        # Read under the transition lock so a span cannot capture a generation mid-refresh.
+        with self._lock:
+            return self._runtime_identity_generation
+
+    def _identity_generation_is_current(self, identity_generation: int) -> bool:
+        # Refresh advances the generation under this same lock.
+        with self._lock:
+            return identity_generation == self._runtime_identity_generation
+
+    def _is_span_identity_current(self, span: Span) -> bool:
+        """Return whether span belongs to the current MicroVM identity generation."""
+        if not self._identity_refresh_enabled:
+            return True
+        with self._lock:
+            return span._get_ctx_item(_RUNTIME_IDENTITY_GENERATION_KEY) == self._runtime_identity_generation
+
+    # Keep the generation check and write atomic so refresh cannot invalidate the trace between them.
+    def _write_if_identity_generation_is_current(self, identity_generation: int, spans: list[Span]) -> None:
+        with self._lock:
+            if identity_generation == self._runtime_identity_generation:
+                writer = self.writer
+                # A sync NativeWriter's write() sends on this thread, which would hold this lock and the
+                # tracer's identity refresh lock across send() retries. Buffer under the lock instead and
+                # leave the send to _flush_pending_sync_write(). Async writers, and writers without
+                # _write_without_flush (LogWriter, HTTPWriter), keep using write().
+                write_without_flush = getattr(writer, "_write_without_flush", None)
+                if write_without_flush is None or not getattr(writer, "_sync_mode", False):
+                    writer.write(spans)
+                elif write_without_flush(spans):
+                    self._pending_sync_flush.writer = writer
+
+    def _flush_pending_sync_write(self) -> None:
+        # Called by Tracer._on_span_finish after it releases the identity refresh lock. The slot is
+        # thread-local so each finishing thread sends only its own write, and it is cleared first so a
+        # failed send is not retried by the next span finish.
+        writer = getattr(self._pending_sync_flush, "writer", None)
+        if writer is not None:
+            self._pending_sync_flush.writer = None
+            writer.flush_queue()
+
     def on_span_start(self, span: Span) -> None:
         # PERF: cache trace_id to avoid repeated Rust property calls (each call allocates a new Python int)
         trace_id = span.trace_id
         with self._lock:
+            # Direct processor callers may not go through Tracer.start_span; stamp those spans here,
+            # while rejecting spans captured before an identity refresh.
+            if self._identity_refresh_enabled:
+                span_generation = span._get_ctx_item(_RUNTIME_IDENTITY_GENERATION_KEY)
+                if span_generation is None:
+                    span_generation = cast(int, self._runtime_identity_generation)
+                    span._set_ctx_item(_RUNTIME_IDENTITY_GENERATION_KEY, span_generation)
+                elif span_generation != self._runtime_identity_generation:
+                    return
+                _set_runtime_identity_generation(span.context, span_generation)
             trace = self._traces[trace_id]
             trace.spans.append(span)
         integration_name = span._get_str_attribute(COMPONENT) or span._span_api
@@ -403,6 +471,12 @@ class SpanAggregator(SpanProcessor):
                 return
 
             trace = self._traces[trace_id]
+            identity_generation = self._runtime_identity_generation
+            if (
+                identity_generation is not None
+                and span._get_ctx_item(_RUNTIME_IDENTITY_GENERATION_KEY) != identity_generation
+            ):
+                return
             trace.num_finished += 1
             num_buffered = len(trace.spans)
             is_trace_complete = trace.num_finished >= num_buffered
@@ -421,6 +495,17 @@ class SpanAggregator(SpanProcessor):
                     return
             else:
                 return
+            # Capture the generation before processing so an identity refresh can invalidate this trace.
+            if identity_generation is not None and any(
+                finished_span._get_ctx_item(_RUNTIME_IDENTITY_GENERATION_KEY) != identity_generation
+                for finished_span in finished
+            ):
+                return
+
+        # The aggregation lock is released before processor execution; recheck the generation
+        # so a refresh that wins this gap cannot send the stale trace through the chain.
+        if identity_generation is not None and not self._identity_generation_is_current(identity_generation):
+            return
 
         # perf: Process spans outside of the span aggregator lock
         if trace.discarded:
@@ -438,6 +523,8 @@ class SpanAggregator(SpanProcessor):
                     self.service_name_processor,
                 ],
             ):
+                if identity_generation is not None and not self._identity_generation_is_current(identity_generation):
+                    return
                 try:
                     result = tp.process_trace(spans) or []
                 except Exception:
@@ -482,7 +569,10 @@ class SpanAggregator(SpanProcessor):
                     sampling_mechanism,
                     should_partial_flush,
                 )
-            self.writer.write(spans)
+            if identity_generation is None:
+                self.writer.write(spans)
+            else:
+                self._write_if_identity_generation_is_current(identity_generation, spans)
 
     def _agent_response_callback(self, resp: AgentResponse) -> None:
         """Handle the response from the agent.
@@ -531,6 +621,12 @@ class SpanAggregator(SpanProcessor):
         """
         Swap the writer between intake and agent submission. Returns True if a swap occurred.
         """
+        if self._identity_refresh_enabled:
+            with self._lock:
+                return self._configure_agentless_writer(enable)
+        return self._configure_agentless_writer(enable)
+
+    def _configure_agentless_writer(self, enable: bool) -> bool:
         if isinstance(self.writer, LogWriter):
             # perf: LogWriter is chosen by create_trace_writer regardless of agentless configs; skip the swap early.
             return False
@@ -571,6 +667,7 @@ class SpanAggregator(SpanProcessor):
         llmobs_enabled: Optional[bool] = None,
         reset_buffer: bool = True,
         flush_writer: Optional[bool] = None,
+        drop_buffered_traces: bool = False,
     ) -> None:
         """
         Resets the internal state of the SpanAggregator, including the writer, sampling processor,
@@ -582,12 +679,14 @@ class SpanAggregator(SpanProcessor):
         """
         if flush_writer is None:
             flush_writer = not reset_buffer
-        if flush_writer:
-            # Flush any encoded spans in the writer's buffer. This operation ensures encoded spans
-            # are not dropped when the writer is recreated. This operation should not be handled after a fork.
-            self.writer.flush_queue()
-        # Re-create the writer to ensure it is consistent with updated configurations (ex: api_version)
-        self.writer = self.writer.recreate(appsec_enabled=appsec_enabled, llmobs_enabled=llmobs_enabled)
+
+        if self._identity_refresh_enabled:
+            # Serialize every writer swap with identity refresh so a concurrent reset cannot
+            # install a writer built for the previous runtime ID.
+            with self._lock:
+                self._reset_writer(appsec_enabled, llmobs_enabled, reset_buffer, flush_writer, drop_buffered_traces)
+        else:
+            self._reset_writer(appsec_enabled, llmobs_enabled, reset_buffer, flush_writer, drop_buffered_traces)
 
         if compute_stats is not None:
             self.sampling_processor._compute_stats_enabled = compute_stats
@@ -597,6 +696,33 @@ class SpanAggregator(SpanProcessor):
 
         if user_processors is not None:
             self.user_processors = user_processors
+
+    def _reset_writer(
+        self,
+        appsec_enabled: Optional[bool],
+        llmobs_enabled: Optional[bool],
+        reset_buffer: bool,
+        flush_writer: bool,
+        drop_buffered_traces: bool,
+    ) -> None:
+        # Only explicit MicroVM refreshes use discard-and-recreate semantics.
+        if drop_buffered_traces and not flush_writer and self._identity_refresh_enabled:
+            # The MicroVM-only branch guarantees that the generation is initialized.
+            self._runtime_identity_generation = cast(int, self._runtime_identity_generation) + 1
+            if reset_buffer:
+                self.reset_trace_buffer_after_fork()
+            self.writer.drop_buffered_traces()
+            self.writer = self.writer.recreate(appsec_enabled=appsec_enabled, llmobs_enabled=llmobs_enabled)
+            return
+
+        if flush_writer:
+            # Flush any encoded spans in the writer's buffer. This operation ensures encoded spans
+            # are not dropped when the writer is recreated. This operation should not be handled after a fork.
+            self.writer.flush_queue()
+        elif drop_buffered_traces:
+            self.writer.drop_buffered_traces()
+        # Re-create the writer to ensure it is consistent with updated configurations (ex: api_version)
+        self.writer = self.writer.recreate(appsec_enabled=appsec_enabled, llmobs_enabled=llmobs_enabled)
 
         # Reset the trace buffer.
         # Useful when forking to prevent sending duplicate spans from parent and child processes.
