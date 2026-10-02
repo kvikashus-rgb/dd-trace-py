@@ -69,39 +69,42 @@ class ThreadingConditionCollector(_lock.LockCollector):
     PATCHED_LOCK_NAME: str = "Condition"
 
 
-_thread_hooks_installed = False
+# Latest hook installed for each Thread method, keyed by method name.
+_installed_thread_hooks: dict[str, typing.Callable[..., None]] = {}
+
+
+def _install_thread_hook(name: str, after: typing.Callable[[threading.Thread], None]) -> None:
+    Thread = ddtrace_threading.Thread
+    original = typing.cast(typing.Callable[..., None], getattr(Thread, name))
+    # The hooks are never removed, so installing them again on every profiler restart would nest
+    # another layer of wrappers around each thread start and exit.
+    if original is _installed_thread_hooks.get(name):
+        return
+
+    def hook(self: threading.Thread, *args: typing.Any, **kwargs: typing.Any) -> None:
+        original(self, *args, **kwargs)
+        # Another library may have wrapped a previous hook, which then stays in the call chain beneath the new one.
+        # Only the latest hook acts so that each thread is registered and unregistered once.
+        if _installed_thread_hooks.get(name) is hook:
+            after(self)
+
+    _installed_thread_hooks[name] = hook
+    setattr(Thread, name, hook)
+
+
+def _register_thread(thread: threading.Thread) -> None:
+    if thread.ident is not None and thread.native_id is not None:
+        stack.register_thread(thread.ident, thread.native_id, thread.name)
+
+
+def _unregister_thread(thread: threading.Thread) -> None:
+    if thread.ident is not None:
+        stack.unregister_thread(thread.ident)
 
 
 def _install_thread_hooks() -> None:
-    global _thread_hooks_installed
-
-    # The hooks are never removed, so installing them again on every profiler restart would nest
-    # another layer of wrappers around each thread start and exit.
-    if _thread_hooks_installed:
-        return
-    _thread_hooks_installed = True
-
-    _thread_set_native_id = typing.cast(
-        typing.Callable[[threading.Thread], None],
-        ddtrace_threading.Thread._set_native_id,  # type: ignore[attr-defined]
-    )
-    _thread_bootstrap_inner = typing.cast(
-        typing.Callable[[threading.Thread], None],
-        ddtrace_threading.Thread._bootstrap_inner,  # type: ignore[attr-defined]
-    )
-
-    def thread_set_native_id(self: threading.Thread) -> None:
-        _thread_set_native_id(self)
-        if self.ident is not None and self.native_id is not None:
-            stack.register_thread(self.ident, self.native_id, self.name)
-
-    def thread_bootstrap_inner(self: threading.Thread, *args: typing.Any, **kwargs: typing.Any) -> None:
-        _thread_bootstrap_inner(self, *args, **kwargs)
-        if self.ident is not None:
-            stack.unregister_thread(self.ident)
-
-    ddtrace_threading.Thread._set_native_id = thread_set_native_id  # type: ignore[attr-defined]
-    ddtrace_threading.Thread._bootstrap_inner = thread_bootstrap_inner  # type: ignore[attr-defined]
+    _install_thread_hook("_set_native_id", _register_thread)
+    _install_thread_hook("_bootstrap_inner", _unregister_thread)
 
 
 # Also patch threading.Thread so echion can track thread lifetimes
