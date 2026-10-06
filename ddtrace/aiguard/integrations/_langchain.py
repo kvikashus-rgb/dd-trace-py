@@ -155,7 +155,8 @@ async def _langchain_claimed_agenerate(func: Callable[..., Any], instance: Any, 
 # __init_subclass__ for the ones defined later.
 _buffered_model_classes: "weakref.WeakSet[type]" = weakref.WeakSet()
 # Held weakly so dynamically defined model classes can still be garbage-collected.
-_buffered_methods: "weakref.WeakKeyDictionary[type, list[str]]" = weakref.WeakKeyDictionary()
+# Each entry is (method name, whether the wrapper was installed over an inherited mixin method).
+_buffered_methods: "weakref.WeakKeyDictionary[type, list[tuple[str, bool]]]" = weakref.WeakKeyDictionary()
 # Each hooked base with the __init_subclass__ it defined itself, if any.
 _hooked_bases: list[tuple[type, Any]] = []
 _buffer_install_lock = RLock()
@@ -191,12 +192,17 @@ def _install_stream_buffers(client: AIGuardClient, base: type, is_chat: bool, mo
                 continue
             walked.append(klass)
             for name, wrapper in _STREAM_METHODS if is_chat else _STREAM_METHODS[:2]:
-                if name in klass.__dict__:
-                    try:
-                        wrap(klass, name, partial(wrapper, client, is_chat))
-                        _buffered_methods.setdefault(klass, []).append(name)
-                    except Exception:
-                        logger.debug("AI Guard langchain: failed to buffer %s.%s", klass, name, exc_info=True)
+                owner = next((c for c in klass.__mro__ if name in c.__dict__), None)
+                # Wrap what klass defines, or inherits from a mixin outside the model
+                # hierarchy (class Model(StreamMixin, BaseChatModel)); a model owner is
+                # wrapped on its own class, and the base's default needs no buffer.
+                if owner is None or owner is base or (owner is not klass and issubclass(owner, base)):
+                    continue
+                try:
+                    wrap(klass, name, partial(wrapper, client, is_chat))
+                    _buffered_methods.setdefault(klass, []).append((name, owner is not klass))
+                except Exception:
+                    logger.debug("AI Guard langchain: failed to buffer %s.%s", klass, name, exc_info=True)
         _buffered_model_classes.update(walked)
 
 
@@ -235,10 +241,14 @@ def _remove_stream_buffers() -> None:
             except Exception:
                 logger.debug("AI Guard langchain: failed to unhook %s", base, exc_info=True)
         _hooked_bases.clear()
-        for klass, names in list(_buffered_methods.items()):
-            for name in names:
+        for klass, methods in list(_buffered_methods.items()):
+            for name, inherited in methods:
                 try:
-                    unwrap(klass, name)
+                    if inherited:
+                        # The wrapper shadows the mixin's method; removing it restores inheritance.
+                        delattr(klass, name)
+                    else:
+                        unwrap(klass, name)
                 except Exception:
                     logger.debug("AI Guard langchain: failed to unbuffer %s.%s", klass, name, exc_info=True)
         _buffered_methods.clear()
@@ -317,30 +327,27 @@ def _buffered_stream(
 
     Both phases are claimed only while the model is read, so the provider below
     skips its own checks and nothing the caller runs between chunks is claimed.
-    With stream analysis off the stream passes through, claimed only for the
-    first read, which is where the provider sends its request. Every read is
-    marked as this model's, so a super()._stream it delegates to later is not
+    With stream analysis off the stream passes through, claimed for each
+    read, never across the caller's yield, so a provider call made on a later read
+    (a super()._stream delegated after a first chunk) is still covered and not
     buffered again.
     """
     _evaluate_buffered_request(client, is_chat, instance, args, kwargs)
     iterator = None
     try:
         if not aiguard_config._ai_guard_analyze_stream_responses_enabled:
-            with aiguard_context(Phase.REQUEST, Phase.RESPONSE):
-                in_buffer = _BUFFERED_MODEL.set(instance)
-                try:
-                    iterator = iter(func(*args, **kwargs))
-                    item = next(iterator, _END)
-                finally:
-                    _BUFFERED_MODEL.reset(in_buffer)
-            while item is not _END:
+            while True:
+                with aiguard_context(Phase.REQUEST, Phase.RESPONSE):
+                    in_buffer = _BUFFERED_MODEL.set(instance)
+                    try:
+                        if iterator is None:
+                            iterator = iter(func(*args, **kwargs))
+                        item = next(iterator, _END)
+                    finally:
+                        _BUFFERED_MODEL.reset(in_buffer)
+                if item is _END:
+                    return
                 yield item
-                in_buffer = _BUFFERED_MODEL.set(instance)
-                try:
-                    item = next(iterator, _END)
-                finally:
-                    _BUFFERED_MODEL.reset(in_buffer)
-            return
 
         events: list[tuple[bool, Any]] = []
         args, kwargs = _defer_run_manager(args, kwargs, events, _DeferredRunManager)
@@ -379,21 +386,18 @@ async def _buffered_astream(
     iterator = None
     try:
         if not aiguard_config._ai_guard_analyze_stream_responses_enabled:
-            with aiguard_context(Phase.REQUEST, Phase.RESPONSE):
-                in_buffer = _BUFFERED_MODEL.set(instance)
-                try:
-                    iterator = func(*args, **kwargs).__aiter__()
-                    item = await _anext_or_end(iterator)
-                finally:
-                    _BUFFERED_MODEL.reset(in_buffer)
-            while item is not _END:
+            while True:
+                with aiguard_context(Phase.REQUEST, Phase.RESPONSE):
+                    in_buffer = _BUFFERED_MODEL.set(instance)
+                    try:
+                        if iterator is None:
+                            iterator = func(*args, **kwargs).__aiter__()
+                        item = await _anext_or_end(iterator)
+                    finally:
+                        _BUFFERED_MODEL.reset(in_buffer)
+                if item is _END:
+                    return
                 yield item
-                in_buffer = _BUFFERED_MODEL.set(instance)
-                try:
-                    item = await _anext_or_end(iterator)
-                finally:
-                    _BUFFERED_MODEL.reset(in_buffer)
-            return
 
         events: list[tuple[bool, Any]] = []
         args, kwargs = _defer_run_manager(args, kwargs, events, _AsyncDeferredRunManager)
@@ -546,8 +550,18 @@ def _evaluate_buffered_events(client: AIGuardClient, args: Any, kwargs: Any, eve
     except Exception:
         logger.debug("AI Guard langchain: failed to convert streamed events; skipping evaluation", exc_info=True)
         return
-    if response_messages and _evaluate_langchain_response(client, request_messages, response_messages):
-        _record_buffer_evaluated(request_messages, response_messages)
+    if not response_messages or not _evaluate_langchain_response(client, request_messages, response_messages):
+        return
+    _record_buffer_evaluated(request_messages, response_messages)
+    fingerprints = _message_tool_call_fingerprints(response)
+    if not fingerprints:
+        return
+    # LangChain merges message-finish metadata into the assembled message's
+    # response_metadata, where the agent hooks look for evaluated tool calls.
+    for event in reversed(events):
+        if isinstance(event, dict) and event.get("event") == "message-finish":
+            event["metadata"] = {**(event.get("metadata") or {}), _EVALUATED_KEY: fingerprints}
+            break
 
 
 def _record_buffer_evaluated(request_messages: list[Message], response_messages: list[Message]) -> None:

@@ -1521,8 +1521,8 @@ def test_subclass_calling_super_stream_is_buffered_once(mock_execute_request, la
 
 @pytest.mark.parametrize("stream_evaluation", [True, False], ids=["buffered", "unbuffered"])
 @patch("ddtrace.aiguard._api_client.AIGuardClient._execute_request")
-def test_stream_claims_once_not_per_chunk(mock_execute_request, langchain, stream_evaluation):
-    """The claim covers the model read (buffered) or its first read (unbuffered), never each chunk."""
+def test_stream_claims_only_the_model_reads(mock_execute_request, langchain, stream_evaluation):
+    """Buffered: one claim for the whole read. Unbuffered: one per read, never across the caller's code."""
     from langchain_core.language_models.fake_chat_models import FakeListChatModel
 
     from ddtrace.aiguard import _context
@@ -1537,7 +1537,8 @@ def test_stream_claims_once_not_per_chunk(mock_execute_request, langchain, strea
         chunks = list(model.stream(input="hi"))
 
     assert len(chunks) > 10
-    assert claim.call_count == 1
+    # Unbuffered reads once per chunk plus the read that ends the stream.
+    assert claim.call_count == (1 if stream_evaluation else len(chunks) + 1)
 
 
 @patch("ddtrace.aiguard._api_client.AIGuardClient._execute_request")
@@ -1628,6 +1629,59 @@ def test_stream_read_directly_blocks_request_before_the_model_is_read(mock_execu
     assert mock_execute_request.call_count == 1
     assert _evaluated_messages(mock_execute_request, 0) == [{"role": "user", "content": "hi"}]
     assert reads == []
+
+
+class _StreamMixin:
+    """Not a model: a model gets its _stream from here, as in class Model(StreamMixin, BaseChatModel)."""
+
+    def _stream(self, messages, stop=None, run_manager=None, **kwargs):
+        yield ChatGenerationChunk(message=AIMessageChunk(content="mixin answer"))
+
+
+class _MixinStreamModel(_StreamMixin, BaseChatModel):
+    @property
+    def _llm_type(self) -> str:
+        return "fake-mixin-stream"
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        raise NotImplementedError
+
+
+@patch("ddtrace.aiguard._api_client.AIGuardClient._execute_request")
+def test_stream_inherited_from_a_mixin_is_buffered(mock_execute_request, langchain):
+    mock_execute_request.side_effect = [mock_evaluate_response("ALLOW"), mock_evaluate_response("DENY")]
+
+    with _stream_evaluation_on(), pytest.raises(AIGuardAbortError):
+        list(_MixinStreamModel().stream(input="hi"))
+
+    assert mock_execute_request.call_count == 2
+    assert _evaluated_messages(mock_execute_request, 1)[-1] == {"role": "assistant", "content": "mixin answer"}
+
+
+@patch("ddtrace.aiguard._api_client.AIGuardClient._execute_request")
+def test_unbuffered_stream_claims_a_provider_read_after_the_first_chunk(mock_execute_request, langchain):
+    """A model that yields a prelude and calls its provider on a later read is still covered there."""
+    from ddtrace.aiguard._context import Phase
+    from ddtrace.aiguard._context import is_aiguard_context_active
+
+    provider_read_claimed = []
+
+    class _LateProviderModel(_SelfReportingChatModel):
+        def _stream(self, *args, **kwargs):
+            yield ChatGenerationChunk(message=AIMessageChunk(content="intro "))
+            provider_read_claimed.append(
+                is_aiguard_context_active(Phase.REQUEST) and is_aiguard_context_active(Phase.RESPONSE)
+            )
+            yield from super()._stream(*args, **kwargs)
+
+    mock_execute_request.return_value = mock_evaluate_response("ALLOW")
+    loop_body_claimed = []
+
+    for _ in _LateProviderModel()._stream([HumanMessage(content="hi")]):
+        loop_body_claimed.append(is_aiguard_context_active())
+
+    assert provider_read_claimed == [True]
+    assert loop_body_claimed == [False, False, False]
 
 
 class _GenerateOnlyChatModel(BaseChatModel):
@@ -1729,7 +1783,7 @@ def test_delayed_super_stream_delegation_is_not_buffered_again(mock_execute_requ
     assert mock_execute_request.call_count == 1
 
 
-def _native_events_model(reads):
+def _native_events_model(reads, message=None):
     pytest.importorskip("langchain_core.language_models.chat_model_stream")
     from langchain_core.language_models._compat_bridge import message_to_events
 
@@ -1745,7 +1799,7 @@ def _native_events_model(reads):
 
         def _stream_chat_model_events(self, messages, stop=None, run_manager=None, **kwargs):
             reads.append(True)
-            yield from message_to_events(AIMessage(content="native answer", id="native-1"))
+            yield from message_to_events(message or AIMessage(content="native answer", id="native-1"))
 
     return _NativeEventsModel()
 
@@ -1769,6 +1823,22 @@ def test_native_protocol_events_are_buffered(mock_execute_request, langchain, de
     assert mock_execute_request.call_count == 2
     assert _evaluated_messages(mock_execute_request, 0) == [{"role": "user", "content": "hi"}]
     assert _evaluated_messages(mock_execute_request, 1)[-1] == {"role": "assistant", "content": "native answer"}
+
+
+@patch("ddtrace.aiguard._api_client.AIGuardClient._execute_request")
+def test_native_protocol_tool_calls_are_marked_evaluated(mock_execute_request, langchain):
+    """The agent hooks must recognise a tool call the buffer already evaluated, as on the chunk path."""
+    from ddtrace.aiguard.integrations._langchain import _tool_call_already_evaluated
+
+    message = AIMessage(content="", id="native-2", tool_calls=[{"name": "add", "args": {"a": 1, "b": 1}, "id": "c1"}])
+    model = _native_events_model([], message)
+    mock_execute_request.return_value = mock_evaluate_response("ALLOW")
+
+    with _stream_evaluation_on():
+        output = model.stream_events(input="hi", version="v3").output
+
+    assert output.tool_calls[0]["name"] == "add"
+    assert _tool_call_already_evaluated(output, "add", {"a": 1, "b": 1})
 
 
 @patch("ddtrace.aiguard._api_client.AIGuardClient._execute_request")
@@ -1839,11 +1909,13 @@ def test_unpatch_removes_stream_buffers(langchain):
         assert "__init_subclass__" not in BaseChatModel.__dict__
         assert not hasattr(FakeListChatModel.__dict__["_stream"], "__wrapped__")
         assert not hasattr(_SelfReportingChatModel.__dict__["_astream"], "__wrapped__")
+        assert "_stream" not in _MixinStreamModel.__dict__
         unpatch_ok = True
     finally:
         langchain_patch()
     assert unpatch_ok
     assert hasattr(FakeListChatModel.__dict__["_stream"], "__wrapped__")
+    assert hasattr(_MixinStreamModel.__dict__["_stream"], "__wrapped__")
 
 
 def test_stream_buffers_do_not_keep_dynamic_model_classes_alive(langchain):
@@ -1857,7 +1929,7 @@ def test_stream_buffers_do_not_keep_dynamic_model_classes_alive(langchain):
             yield from super()._stream(*args, **kwargs)
 
     assert hasattr(_DynamicModel.__dict__["_stream"], "__wrapped__")
-    assert _buffered_methods[_DynamicModel] == ["_stream"]
+    assert _buffered_methods[_DynamicModel] == [("_stream", False)]
 
     model_class = weakref.ref(_DynamicModel)
     del _DynamicModel
