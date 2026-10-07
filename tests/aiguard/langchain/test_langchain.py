@@ -1684,6 +1684,110 @@ def test_unbuffered_stream_claims_a_provider_read_after_the_first_chunk(mock_exe
     assert loop_body_claimed == [False, False, False]
 
 
+class _NonCooperativeBase(BaseChatModel):
+    """A plugin base whose __init_subclass__ skips super(), so the AI Guard hook never sees its subclasses."""
+
+    def __init_subclass__(cls, **kwargs):
+        pass
+
+
+@pytest.mark.parametrize("entry", ["stream", "invoke"])
+@patch("ddtrace.aiguard._api_client.AIGuardClient._execute_request")
+def test_model_missed_by_the_subclass_hook_is_buffered_on_first_use(mock_execute_request, langchain, entry):
+    class _HiddenModel(_NonCooperativeBase):
+        @property
+        def _llm_type(self) -> str:
+            return "fake-hidden"
+
+        def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+            from langchain_core.language_models.chat_models import generate_from_stream
+
+            return generate_from_stream(self._stream(messages, stop, run_manager, **kwargs))
+
+        def _stream(self, messages, stop=None, run_manager=None, **kwargs):
+            yield ChatGenerationChunk(message=AIMessageChunk(content="hidden answer"))
+
+    assert not hasattr(_HiddenModel.__dict__["_stream"], "__wrapped__")
+    mock_execute_request.side_effect = [mock_evaluate_response("ALLOW"), mock_evaluate_response("DENY")]
+
+    with _stream_evaluation_on(), pytest.raises(AIGuardAbortError):
+        if entry == "stream":
+            list(_HiddenModel().stream(input="hi"))
+        else:
+            _HiddenModel().invoke("hi")
+
+    assert hasattr(_HiddenModel.__dict__["_stream"], "__wrapped__")
+    assert _evaluated_messages(mock_execute_request, 1)[-1] == {"role": "assistant", "content": "hidden answer"}
+
+
+@pytest.mark.asyncio
+@patch("ddtrace.aiguard._api_client.AIGuardClient._execute_request")
+async def test_child_task_streaming_the_same_model_is_evaluated(mock_execute_request, langchain):
+    """A task created during a read inherits the same-model marker; its own stream must still be evaluated."""
+    import asyncio
+
+    class _FanOutModel(_SelfReportingChatModel):
+        async def _astream(self, messages, stop=None, run_manager=None, fan_out=True, **kwargs):
+            if not fan_out:
+                yield ChatGenerationChunk(message=AIMessageChunk(content="child answer"))
+                return
+
+            async def child():
+                return [chunk async for chunk in self._astream(messages, fan_out=False)]
+
+            for chunk in await asyncio.create_task(child()):
+                yield chunk
+
+    # The outer request, then the child task's own request.
+    mock_execute_request.side_effect = [mock_evaluate_response("ALLOW"), mock_evaluate_response("DENY")]
+
+    with pytest.raises(AIGuardAbortError):
+        [chunk async for chunk in _FanOutModel()._astream([HumanMessage(content="hi")])]
+
+    assert mock_execute_request.call_count == 2
+
+
+@pytest.mark.asyncio
+@patch("ddtrace.aiguard._api_client.AIGuardClient._execute_request")
+async def test_stream_of_other_messages_inside_generate_is_evaluated(mock_execute_request, langchain):
+    """generate's .before listener covers its own prompt only: another request it streams, in any task, is evaluated."""
+    import asyncio
+
+    from langchain_core.language_models.chat_models import agenerate_from_stream
+
+    class _SideStreamModel(_SelfReportingChatModel):
+        async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
+            side_request = [HumanMessage(content="side request")]
+            return await asyncio.create_task(agenerate_from_stream(self._astream(side_request)))
+
+    mock_execute_request.return_value = mock_evaluate_response("ALLOW")
+
+    await _SideStreamModel().ainvoke("hi")
+
+    user_prompts = [
+        _evaluated_messages(mock_execute_request, index)[-1]["content"]
+        for index in range(mock_execute_request.call_count)
+        if _evaluated_messages(mock_execute_request, index)[-1]["role"] == "user"
+    ]
+    assert user_prompts == ["hi", "side request"]
+
+
+@pytest.mark.asyncio
+@patch("ddtrace.aiguard._api_client.AIGuardClient._execute_request")
+async def test_async_super_delegation_in_the_same_task_is_buffered_once(mock_execute_request, langchain):
+    class _DelegatingModel(_SelfReportingChatModel):
+        async def _astream(self, *args, **kwargs):
+            async for chunk in super()._astream(*args, **kwargs):
+                yield chunk
+
+    mock_execute_request.side_effect = [mock_evaluate_response("ALLOW"), mock_evaluate_response("DENY")]
+
+    chunks = [chunk async for chunk in _DelegatingModel()._astream([HumanMessage(content="hi")])]
+
+    assert _chunk_text(chunk.message for chunk in chunks) == "self reported"
+    assert mock_execute_request.call_count == 1
+
+
 class _GenerateOnlyChatModel(BaseChatModel):
     """Chat model without _stream: LangChain serves its stream() through invoke()."""
 

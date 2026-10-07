@@ -206,12 +206,15 @@ of `_stream`. Subclasses define those methods themselves, so the wrappers are
 installed per class (including a method a model inherits from a non-model mixin,
 as in `class Model(StreamMixin, BaseChatModel)`): at `langchain.patch` for every
 existing subclass, and from an `__init_subclass__` hook on `BaseChatModel` /
-`BaseLLM` for classes defined later (`_buffer_model_classes`). Installing on first use of `generate` or
-`stream` is not enough: paths such as `stream_events(version="v3")` read
-`_stream` directly. A buffer skips only a `super()._stream` call on the model it
-is already reading, on every read of that model, not only the first; another
-model streamed during that read (a router model's inner model) gets its own
-buffer. The layer matters:
+`BaseLLM` for classes defined later (`_buffer_model_classes`). A plugin base whose
+own `__init_subclass__` skips `super()` hides its subclasses from that hook, so
+`generate`, `stream`, `astream` and the v3 event readers also install a missing
+class's buffers before reading (`_ensure_buffered`). A buffer skips only a
+`super()._stream` call on the model it is already reading, on every read of that
+model, not only the first, and only in the same task or thread (`_marker`): a
+task created during the read inherits the marker but streams on its own buffer.
+Another model streamed during that read (a router model's inner model) gets its
+own buffer too. The layer matters:
 
 - **Below LangChain's callbacks.** `stream()`, `astream_events()`, LangGraph's
   `stream_mode="messages"` and generate's internal streaming all hand each
@@ -224,8 +227,9 @@ buffer. The layer matters:
   in its own read timeout, so a provider buffer that drains the whole stream on
   the first read turns a long generation into a timeout.
 - **Request first.** The buffer evaluates the request before it claims and
-  reads the model, unless that model's own `generate` is running
-  (`_GENERATING_MODEL`), whose `.before` listener already did. A direct
+  reads the model, skipping only a payload the surrounding `generate` call's
+  `.before` listener already evaluated (`_GENERATE_REQUESTS`, matched by
+  content: LangChain's `agenerate` reads each prompt in a new task). A direct
   `_stream` read has no other request check, and the claim makes the provider
   skip its own. AI Guard does not listen to `.stream.before`.
 - **Once per call.** When generate streams internally, the buffer records the
