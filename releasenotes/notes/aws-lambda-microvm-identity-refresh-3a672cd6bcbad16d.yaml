@@ -1,5 +1,0 @@
----
-features:
-  - |
-    internal: Rotates the runtime ID and refreshes registered components when applications
-    start in AWS Lambda MicroVM environments.

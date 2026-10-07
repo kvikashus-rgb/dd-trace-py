@@ -155,7 +155,10 @@ def test_web_request_starting_does_not_dispatch_without_a_listener():
 def test_web_request_starting_isolates_listener_errors():
     event_name = WebFrameworkEvents.WEB_REQUEST_STARTING.value
 
+    calls = []
+
     def fail_request_starting(request_method, request_path):
+        calls.append((request_method, request_path))
         raise RuntimeError("boom")
 
     original_raise = config._raise
@@ -172,6 +175,8 @@ def test_web_request_starting_isolates_listener_errors():
     finally:
         core.reset_listeners(event_name, fail_request_starting)
         config._raise = original_raise
+
+    assert calls == [("POST", "/aws/lambda-microvms/runtime/v1/run")]
 
 
 def test_web_request_starting_dispatch_precedes_span_creation(tracer):
@@ -207,7 +212,6 @@ def test_microvm_run_hook_refreshes_identity(tracer):
     event_name = WebFrameworkEvents.WEB_REQUEST_STARTING.value
     app = TestApp(DDWSGIMiddleware(application, tracer=tracer))
     _runtime_id._IDENTITY_REFRESH_HOOK_REFRESHED.clear()
-    _runtime_id._IDENTITY_REFRESH_HOOK_RUNTIME_ID = None
     core.reset_listeners(event_name, runtime.maybe_refresh_identity)
 
     try:
@@ -228,7 +232,6 @@ def test_microvm_run_hook_refreshes_identity(tracer):
     finally:
         core.reset_listeners(event_name, runtime.maybe_refresh_identity)
         _runtime_id._IDENTITY_REFRESH_HOOK_REFRESHED.clear()
-        _runtime_id._IDENTITY_REFRESH_HOOK_RUNTIME_ID = None
 
 
 def test_middleware(tracer, test_spans):

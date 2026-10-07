@@ -231,16 +231,24 @@ async def test_microvm_run_hook_refreshes_identity(scope):
     event_name = WebFrameworkEvents.WEB_REQUEST_STARTING.value
     app = TraceMiddleware(basic_app)
     scope.update({"method": "POST", "path": "/run", "root_path": "/aws/lambda-microvms/runtime/v1"})
+    # The middleware stores its spans in scope["datadog"], and a scope that has it is treated as a
+    # sub-app that skips the request-start event. Give each request its own copy.
+    base_scope = dict(scope)
+    dispatched = []
+
+    def record_request_starting(method, path):
+        dispatched.append((method, path))
+
     _runtime_id._IDENTITY_REFRESH_HOOK_REFRESHED.clear()
-    _runtime_id._IDENTITY_REFRESH_HOOK_RUNTIME_ID = None
     core.reset_listeners(event_name, runtime.maybe_refresh_identity)
+    core.on(event_name, record_request_starting)
 
     try:
         with mock.patch.object(_runtime_id, "in_aws_lambda_microvm", return_value=True):
             runtime.listen_for_identity_refresh_hooks(core.on)
             runtime_id = runtime.get_runtime_id()
 
-            instance = ApplicationCommunicator(app, scope)
+            instance = ApplicationCommunicator(app, dict(base_scope))
             await instance.send_input({"type": "http.request", "body": b""})
             await instance.receive_output(1)
             await instance.receive_output(1)
@@ -248,16 +256,18 @@ async def test_microvm_run_hook_refreshes_identity(scope):
             refreshed_runtime_id = runtime.get_runtime_id()
             assert refreshed_runtime_id != runtime_id
 
-            instance = ApplicationCommunicator(app, scope)
+            instance = ApplicationCommunicator(app, dict(base_scope))
             await instance.send_input({"type": "http.request", "body": b""})
             await instance.receive_output(1)
             await instance.receive_output(1)
 
+            # Both requests dispatched the event, so the once-per-process guard kept the ID.
+            assert len(dispatched) == 2
             assert runtime.get_runtime_id() == refreshed_runtime_id
     finally:
         core.reset_listeners(event_name, runtime.maybe_refresh_identity)
+        core.reset_listeners(event_name, record_request_starting)
         _runtime_id._IDENTITY_REFRESH_HOOK_REFRESHED.clear()
-        _runtime_id._IDENTITY_REFRESH_HOOK_RUNTIME_ID = None
 
 
 @pytest.mark.asyncio
