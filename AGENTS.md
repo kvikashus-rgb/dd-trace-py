@@ -3,7 +3,7 @@
 Single source of truth for all AI coding assistants. Tool-specific entry points
 (`.claude/CLAUDE.md`, `.cursor/rules/dd-trace-py.mdc`) import this file.
 
-## Project Rules
+## Project Rule
 
 1. **Testing** — NEVER run `pytest` directly. Use the `run-tests` skill (`scripts/run-tests`). See `docs/contributing-testing.rst`.
 2. **Linting** — NEVER use raw linting tools. Use the `lint` skill (`scripts/lint <subcommand>`).
@@ -143,7 +143,7 @@ Use the Skill tool to invoke these. **Always prefer skills over raw commands.**
 | Linting                                                         | `.cursor/rules/linting.mdc`                                             | —                                                                                                                                                   |
 | Testing                                                         | `.cursor/rules/testing.mdc`                                             | —                                                                                                                                                   |
 
-## AIDEV Anchor Comments
+## AIDEV Anchor Comments ##
 
 The guild deprecated `AIDEV-NOTE:`, `AIDEV-TODO:`, and `AIDEV-QUESTION:` labels.
 Existing anchors were removed from the repository (#20143).
@@ -153,3 +153,6 @@ Existing anchors were removed from the repository (#20143).
 - CI (`scripts/check_no_new_aidev_anchors.py`) blocks new anchors on added diff
   lines. Policy docs (`AGENTS.md`, `.cursor/rules/`), the checker script, and
   its tests are excluded because they document or exercise the deprecation.
+
+
+Testing 

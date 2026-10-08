@@ -11,12 +11,6 @@ class ConftestTestCase(TracerTestCase):
     Test case to verify conftest code works as expected
     """
 
-    @pytest.fixture(autouse=True)
-    def fixtures(self, testdir):
-        """
-        Fixtures to use in tests
-        """
-        self.testdir = testdir
 
     def makeconftest(self, conftest_rel_path="../conftest.py"):
         """
